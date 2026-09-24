@@ -10,7 +10,8 @@ This repository is an unlearning framework. Given a trained policy that can perf
 
 ### News
 
-[2026.9.24] The preprint is now on arXiv.
+[2026.9.24] The preprint is now on arXiv. 
+
 [2026.9.19] Our work is done! The code will be made open source soon.
 
 

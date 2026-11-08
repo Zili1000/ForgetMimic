@@ -1,0 +1,154 @@
+"""G1 WBC task builders and mjlab task registry entries."""
+
+from __future__ import annotations
+
+from mjlab.envs import ManagerBasedRlEnvCfg
+
+from wbc_mjlab.env.mdp.commands import MotionCommandCfg
+from wbc_mjlab.presets.binary_failure import apply_binary_failure
+from wbc_mjlab.presets.se_actor import apply_se_actor
+from wbc_mjlab.presets.wbc import apply_wbc
+from wbc_mjlab.presets.zest import apply_zest
+from wbc_mjlab.robots.g1.base import g1_base_cfg, wire_g1_imu_sensors
+from wbc_mjlab.robots.g1.constants import (
+  G1_EE_TERMINATION_BODY_NAMES,
+  G1_ENDEFFECTOR_BODY_NAMES,
+  G1_MOTION_BODY_NAMES,
+)
+from wbc_mjlab.tasks.config import WbcTaskConfig
+
+DEFAULT_G1_TASK_ID = "Wbc-G1"
+
+
+def g1_wbc_env_cfg() -> ManagerBasedRlEnvCfg:
+  cfg = g1_base_cfg()
+  apply_wbc(
+    cfg,
+    motion_body_names=G1_MOTION_BODY_NAMES,
+    ee_termination_bodies=G1_EE_TERMINATION_BODY_NAMES,
+  )
+  return cfg
+
+
+def g1_wbc_se_env_cfg() -> ManagerBasedRlEnvCfg:
+  cfg = g1_wbc_env_cfg()
+  apply_se_actor(cfg)
+  wire_g1_imu_sensors(cfg)
+  return cfg
+
+
+def g1_wbc_zest_env_cfg() -> ManagerBasedRlEnvCfg:
+  cfg = g1_base_cfg()
+  apply_zest(
+    cfg,
+    reward_body_names=G1_ENDEFFECTOR_BODY_NAMES,
+    contact_body_names=G1_MOTION_BODY_NAMES,
+  )
+  return cfg
+
+
+def g1_wbc_zest_se_env_cfg() -> ManagerBasedRlEnvCfg:
+  cfg = g1_wbc_zest_env_cfg()
+  apply_se_actor(cfg)
+  wire_g1_imu_sensors(cfg)
+  return cfg
+
+
+def g1_wbc_binary_failure_env_cfg() -> ManagerBasedRlEnvCfg:
+  cfg = g1_base_cfg()
+  apply_binary_failure(cfg)
+  return cfg
+
+
+G1_WBC_TASKS: tuple[WbcTaskConfig, ...] = (
+  WbcTaskConfig(
+    task_id="Wbc-G1",
+    robot_id="g1",
+    description=(
+      "Zest Table S4 tracking + RSI, EE z resets, light foot slip / anti-shake, history=1."
+    ),
+    experiment_name="wbc_g1",
+    build_env_cfg=g1_wbc_env_cfg,
+  ),
+  WbcTaskConfig(
+    task_id="Wbc-G1-SE",
+    robot_id="g1",
+    description="Wbc-G1 + SE obs (anchor pose tracking error, base lin vel).",
+    experiment_name="wbc_g1_se",
+    build_env_cfg=g1_wbc_se_env_cfg,
+  ),
+  WbcTaskConfig(
+    task_id="Wbc-G1-Zest",
+    robot_id="g1",
+    description="Zest paper repro: no SE, reward-aligned RSI.",
+    experiment_name="wbc_g1_zest",
+    build_env_cfg=g1_wbc_zest_env_cfg,
+  ),
+  WbcTaskConfig(
+    task_id="Wbc-G1-Zest-SE",
+    robot_id="g1",
+    description="Zest + SE obs (anchor pose tracking error, base lin vel).",
+    experiment_name="wbc_g1_zest_se",
+    build_env_cfg=g1_wbc_zest_se_env_cfg,
+  ),
+  WbcTaskConfig(
+    task_id="Wbc-G1-BinaryFailure",
+    robot_id="g1",
+    description="Full obs, whole-body RSI with binary failure (BeyondMimic paper).",
+    experiment_name="wbc_g1_binary",
+    build_env_cfg=g1_wbc_binary_failure_env_cfg,
+  ),
+)
+
+G1_TASK_BY_ID: dict[str, WbcTaskConfig] = {t.task_id: t for t in G1_WBC_TASKS}
+
+
+def get_g1_task_config(task_id: str = DEFAULT_G1_TASK_ID) -> WbcTaskConfig:
+  try:
+    return G1_TASK_BY_ID[task_id]
+  except KeyError as exc:
+    known = ", ".join(sorted(G1_TASK_BY_ID))
+    raise KeyError(f"Unknown G1 task {task_id!r}. Known: {known}") from exc
+
+
+def make_g1_wbc_env_cfg(
+  *,
+  play: bool = False,
+  task_id: str = DEFAULT_G1_TASK_ID,
+  **kwargs,
+) -> ManagerBasedRlEnvCfg:
+  if kwargs:
+    unknown = ", ".join(sorted(kwargs))
+    raise TypeError(
+      f"Unknown env cfg kwargs for G1: {unknown}. Pass task_id=<Wbc-G1-…>."
+    )
+  cfg = get_g1_task_config(task_id).build_env_cfg()
+
+  if play:
+    cfg.episode_length_s = int(1e9)
+    cfg.observations["actor"].enable_corruption = False
+    cfg.curriculum = {}
+    cfg.events.pop("push_robot", None)
+    motion_cmd = cfg.commands["motion"]
+    assert isinstance(motion_cmd, MotionCommandCfg)
+    motion_cmd.pose_range = {}
+    motion_cmd.velocity_range = {}
+    motion_cmd.assistive_wrench_enabled = False
+    if "assistive_wrench" in cfg.events:
+      cfg.events["assistive_wrench"].params["enabled"] = False
+
+  return cfg
+
+
+__all__ = [
+  "DEFAULT_G1_TASK_ID",
+  "G1_TASK_BY_ID",
+  "G1_WBC_TASKS",
+  "get_g1_task_config",
+  "g1_wbc_binary_failure_env_cfg",
+  "g1_wbc_env_cfg",
+  "g1_wbc_se_env_cfg",
+  "g1_wbc_zest_env_cfg",
+  "g1_wbc_zest_se_env_cfg",
+  "make_g1_wbc_env_cfg",
+]

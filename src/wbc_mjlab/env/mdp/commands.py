@@ -1,0 +1,1226 @@
+from __future__ import annotations
+
+import copy
+import math
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal
+
+import mujoco
+import numpy as np
+import torch
+from mjlab.managers import CommandTerm
+from mjlab.tasks.tracking.mdp import MotionCommandCfg as MjlabMotionCommandCfg
+from mjlab.utils.lab_api.math import (
+  matrix_from_quat,
+  quat_apply,
+  quat_apply_inverse,
+  quat_error_magnitude,
+  quat_from_euler_xyz,
+  quat_inv,
+  quat_mul,
+  sample_uniform,
+  yaw_quat,
+)
+from mjlab.viewer.debug_visualizer import DebugVisualizer
+
+from wbc_mjlab.env.mdp.sampling import (
+  RsiCfg,
+  TrackingSimilarityState,
+  bin_index_for_frame,
+  build_bin_valid_mask,
+  compile_similarity_terms,
+  compute_assist_gain_matrix,
+  compute_sampling_prob_matrix,
+  resolve_tracking_reward_indices,
+  rsi_failure_signal_label,
+  sample_adaptive_bins,
+  trajectory_conditional_prob_row,
+  step_tracking_reward_similarity,
+  step_tracking_similarity,
+  update_failure_ema,
+)
+from wbc_mjlab.viewer.motion_vis import (
+  clip_name_for_trajectory,
+  error_to_rgba,
+  format_motion_context_html,
+  format_rsi_panel_html,
+)
+
+if TYPE_CHECKING:
+  from collections.abc import Callable
+  from typing import Any
+
+  import viser
+  from mjlab.entity import Entity
+  from mjlab.envs import ManagerBasedRlEnv
+
+_DESIRED_FRAME_COLORS = ((1.0, 0.5, 0.5), (0.5, 1.0, 0.5), (0.5, 0.5, 1.0))
+
+
+class MotionLoader:
+  """Load a motion library from a bundled NPZ or a dataset directory (``npz/*.npz``)."""
+
+  def __init__(
+    self,
+    motion_file: str,
+    body_indexes: torch.Tensor,
+    anchor_body_index: int,
+    step_dt: float,
+    device: str = "cpu",
+  ) -> None:
+    from wbc_mjlab.motion.stack_bundle import (
+      list_clip_npz_files,
+      stack_clip_arrays_from_paths,
+    )
+
+    body_idx = body_indexes.detach().cpu().numpy()
+    source = Path(motion_file).expanduser().resolve()
+    self.motion_source = str(source)
+
+    if source.is_dir():
+      clip_paths = list_clip_npz_files(source)
+      if not clip_paths:
+        raise FileNotFoundError(
+          f"No clip NPZs in {source / 'npz'}; convert clips or pass a .npz bundle."
+        )
+      stacked = stack_clip_arrays_from_paths(clip_paths)
+      seg_start = stacked.segment_start_idx
+      seg_len = stacked.segment_length
+      self._load_arrays(
+        joint_pos=stacked.joint_pos,
+        joint_vel=stacked.joint_vel,
+        body_pos_w=stacked.body_pos_w,
+        body_quat_w=stacked.body_quat_w,
+        body_lin_vel_w=stacked.body_lin_vel_w,
+        body_ang_vel_w=stacked.body_ang_vel_w,
+        seg_start=seg_start,
+        seg_len=seg_len,
+        body_idx=body_idx,
+        anchor_body_index=anchor_body_index,
+        step_dt=step_dt,
+        device=device,
+        segment_names=stacked.clip_names,
+      )
+      return
+
+    if not source.is_file():
+      raise FileNotFoundError(f"Motion source not found: {source}")
+
+    with np.load(source, allow_pickle=True) as data:
+      if "segment_start_idx" in data and "segment_length" in data:
+        seg_start = np.asarray(data["segment_start_idx"], dtype=np.int64)
+        seg_len = np.asarray(data["segment_length"], dtype=np.int64)
+      else:
+        total = int(data["joint_pos"].shape[0])
+        seg_start = np.asarray([0], dtype=np.int64)
+        seg_len = np.asarray([total], dtype=np.int64)
+
+      if "segment_names" in data:
+        segment_names = tuple(str(x) for x in data["segment_names"].tolist())
+      elif "segment_source" in data:
+        from wbc_mjlab.motion.manifest import clip_name_from_path
+
+        segment_names = tuple(
+          clip_name_from_path(str(x)) for x in data["segment_source"].tolist()
+        )
+      else:
+        segment_names = (source.stem,)
+
+      self._load_arrays(
+        joint_pos=np.asarray(data["joint_pos"]),
+        joint_vel=np.asarray(data["joint_vel"]),
+        body_pos_w=np.asarray(data["body_pos_w"]),
+        body_quat_w=np.asarray(data["body_quat_w"]),
+        body_lin_vel_w=np.asarray(data["body_lin_vel_w"]),
+        body_ang_vel_w=np.asarray(data["body_ang_vel_w"]),
+        seg_start=seg_start,
+        seg_len=seg_len,
+        body_idx=body_idx,
+        anchor_body_index=anchor_body_index,
+        step_dt=step_dt,
+        device=device,
+        segment_names=segment_names,
+      )
+
+  def _load_arrays(
+    self,
+    *,
+    joint_pos: np.ndarray,
+    joint_vel: np.ndarray,
+    body_pos_w: np.ndarray,
+    body_quat_w: np.ndarray,
+    body_lin_vel_w: np.ndarray,
+    body_ang_vel_w: np.ndarray,
+    seg_start: np.ndarray,
+    seg_len: np.ndarray,
+    body_idx: np.ndarray,
+    anchor_body_index: int,
+    step_dt: float,
+    device: str,
+    segment_names: tuple[str, ...] = (),
+  ) -> None:
+    self.joint_pos = torch.as_tensor(joint_pos, dtype=torch.float32, device=device)
+    self.joint_vel = torch.as_tensor(joint_vel, dtype=torch.float32, device=device)
+    self.body_pos_w = torch.as_tensor(
+      np.asarray(body_pos_w[:, body_idx], dtype=np.float32), device=device
+    )
+    self.body_quat_w = torch.as_tensor(
+      np.asarray(body_quat_w[:, body_idx], dtype=np.float32), device=device
+    )
+    self.body_lin_vel_w = torch.as_tensor(
+      np.asarray(body_lin_vel_w[:, body_idx], dtype=np.float32), device=device
+    )
+    self.body_ang_vel_w = torch.as_tensor(
+      np.asarray(body_ang_vel_w[:, body_idx], dtype=np.float32), device=device
+    )
+    self.time_step_total = int(self.joint_pos.shape[0])
+
+    self.segment_start_idx = torch.tensor(seg_start, dtype=torch.long, device=device)
+    self.segment_length = torch.tensor(seg_len, dtype=torch.long, device=device)
+    self.num_trajectories = int(self.segment_start_idx.shape[0])
+    self.segment_end_idx = self.segment_start_idx + self.segment_length
+    if len(segment_names) < self.num_trajectories:
+      segment_names = segment_names + tuple(
+        f"traj_{i}" for i in range(len(segment_names), self.num_trajectories)
+      )
+    self.segment_names = segment_names
+
+    anchor_lin_vel = self.body_lin_vel_w[:, anchor_body_index]
+    anchor_ang_vel = self.body_ang_vel_w[:, anchor_body_index]
+    self.anchor_lin_acc_w = torch.gradient(anchor_lin_vel, spacing=step_dt, dim=0)[0]
+    self.anchor_ang_acc_w = torch.gradient(anchor_ang_vel, spacing=step_dt, dim=0)[0]
+
+
+class MotionCommand(CommandTerm):
+  """Multi-clip motion playback with RSI resampling and assistive-wrench state.
+
+  Loads an NPZ motion library, streams reference kinematics each step, and
+  resamples start frames at episode boundaries according to :class:`RsiCfg`.
+  Observation and reward terms read reference state from this command via
+  ``command_name="motion"``.
+  """
+
+  cfg: MotionCommandCfg
+  _env: ManagerBasedRlEnv
+
+  def __init__(self, cfg: MotionCommandCfg, env: ManagerBasedRlEnv):
+    super().__init__(cfg, env)
+
+    self.robot: Entity = env.scene[cfg.entity_name]
+    if cfg.actuated_joint_names:
+      tracked_joint_ids, _ = self.robot.find_joints(
+        cfg.actuated_joint_names, preserve_order=True
+      )
+      self._tracked_joint_ids = torch.tensor(
+        tracked_joint_ids, dtype=torch.long, device=self.device
+      )
+    else:
+      self._tracked_joint_ids = None
+    self.robot_anchor_body_index = self.robot.body_names.index(
+      self.cfg.anchor_body_name
+    )
+    self.motion_anchor_body_index = self.cfg.body_names.index(self.cfg.anchor_body_name)
+    self.body_indexes = torch.tensor(
+      self.robot.find_bodies(self.cfg.body_names, preserve_order=True)[0],
+      dtype=torch.long,
+      device=self.device,
+    )
+
+    self.motion = MotionLoader(
+      self.cfg.motion_file,
+      self.body_indexes,
+      anchor_body_index=self.motion_anchor_body_index,
+      step_dt=env.step_dt,
+      device=self.device,
+    )
+    self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+    self.trajectory_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+    self.body_pos_relative_w = torch.zeros(
+      self.num_envs, len(cfg.body_names), 3, device=self.device
+    )
+    self.body_quat_relative_w = torch.zeros(
+      self.num_envs, len(cfg.body_names), 4, device=self.device
+    )
+    self.body_quat_relative_w[:, :, 0] = 1.0
+
+    self.bin_width_frames = max(
+      1, int(math.ceil(cfg.rsi.bin_width_s / max(env.step_dt, 1.0e-6)))
+    )
+    segment_bins = torch.ceil(
+      self.motion.segment_length.float() / float(self.bin_width_frames)
+    ).long()
+    self.bins_per_trajectory = max(1, int(segment_bins.max().item()))
+    self.bin_valid_mask = build_bin_valid_mask(
+      self.motion.segment_length,
+      bins_per_trajectory=self.bins_per_trajectory,
+      bin_width_frames=self.bin_width_frames,
+      min_bin_span_ratio=cfg.rsi.min_bin_span_ratio,
+      device=self.device,
+    )
+    self._valid_bin_indices = self.bin_valid_mask.nonzero(as_tuple=False)
+    if self._valid_bin_indices.numel() == 0:
+      raise ValueError(
+        "No valid RSI bins after applying min_bin_span_ratio; "
+        "lower min_bin_span_ratio or use shorter bin_width_s."
+      )
+
+    self.bin_failure_levels = torch.zeros(
+      self.motion.num_trajectories,
+      self.bins_per_trajectory,
+      dtype=torch.float,
+      device=self.device,
+    )
+    self.bin_visit_counts = torch.zeros(
+      self.motion.num_trajectories,
+      self.bins_per_trajectory,
+      dtype=torch.float,
+      device=self.device,
+    )
+
+    self._episode_similarity_sum = torch.zeros(self.num_envs, device=self.device)
+    self._episode_similarity_denom = torch.ones(self.num_envs, device=self.device)
+    self._episode_step_count = torch.zeros(
+      self.num_envs, dtype=torch.long, device=self.device
+    )
+    self._episode_start_step = torch.zeros(
+      self.num_envs, dtype=torch.long, device=self.device
+    )
+    self._episode_start_bin = torch.zeros(
+      self.num_envs, dtype=torch.long, device=self.device
+    )
+    self.episode_assist_gain = torch.zeros(self.num_envs, device=self.device)
+    self.assist_force_w = torch.zeros(self.num_envs, 3, device=self.device)
+    self.assist_torque_w = torch.zeros(self.num_envs, 3, device=self.device)
+
+    self.metrics["error_anchor_pos"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["error_anchor_rot"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["error_anchor_lin_vel"] = torch.zeros(
+      self.num_envs, device=self.device
+    )
+    self.metrics["error_anchor_ang_vel"] = torch.zeros(
+      self.num_envs, device=self.device
+    )
+    self.metrics["error_body_pos"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["error_body_rot"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["error_joint_pos"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["error_joint_vel"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["sampling_entropy"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["sampling_top1_prob"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["sampling_top1_bin"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["assist_gain_mean"] = torch.zeros(self.num_envs, device=self.device)
+
+    self._similarity_terms, similarity_weight_sum = compile_similarity_terms(
+      cfg.rsi.similarity_terms
+    )
+    self._similarity_term_weight_sum = max(similarity_weight_sum, 1.0e-6)
+    if (
+      cfg.rsi.strategy == "similarity_ema"
+      and not cfg.rsi.similarity_from_rewards
+      and similarity_weight_sum <= 0.0
+    ):
+      raise ValueError(
+        "similarity_ema requires at least one rsi.similarity_terms entry with weight > 0 "
+        "when similarity_from_rewards=False."
+      )
+    self._tracking_reward_indices: list[int] | None = None
+    self._tracking_reward_weight_sum = 0.0
+
+    self._ghost_model: mujoco.MjModel | None = None
+    self._ghost_color = np.array(cfg.viz.ghost_color, dtype=np.float32)
+
+    self._viewer_task_id: str | None = None
+    self._viewer_align_xy_yaw = False
+    self._viewer_color_bodies = False
+    self._viewer_context_html = None
+    self._viewer_rsi_html = None
+
+  @property
+  def bin_count(self) -> int:
+    return self.motion.num_trajectories * self.bins_per_trajectory
+
+  def _set_episode_similarity_denom(
+    self, env_ids: torch.Tensor, traj_ids: torch.Tensor, time_steps: torch.Tensor
+  ) -> None:
+    if not self.cfg.rsi.similarity_norm_by_remaining_clip:
+      return
+    seg_start = self.motion.segment_start_idx[traj_ids]
+    seg_len = self.motion.segment_length[traj_ids]
+    local_step = torch.clamp(time_steps - seg_start, min=0)
+    remaining = seg_len - local_step
+    max_episode = float(self._env.max_episode_length)
+    norm = torch.minimum(
+      remaining.float(),
+      torch.full_like(remaining.float(), max_episode),
+    )
+    self._episode_similarity_denom[env_ids] = torch.clamp(norm, min=1.0)
+
+  def _update_failure_levels(self, env_ids: torch.Tensor) -> None:
+    if self.cfg.rsi.sampling_mode != "adaptive" or env_ids.numel() == 0:
+      return
+
+    active_mask = self._episode_step_count[env_ids] > 0
+    if not torch.any(active_mask):
+      return
+    env_ids = env_ids[active_mask]
+
+    rsi = self.cfg.rsi
+    strategy = rsi.strategy
+    update_failure_ema(
+      self.bin_failure_levels,
+      strategy=strategy,
+      bins_per_trajectory=self.bins_per_trajectory,
+      alpha=rsi.alpha,
+      traj_ids=self.trajectory_ids[env_ids],
+      start_bins=self._episode_start_bin[env_ids],
+      episode_terminated=(
+        self._env.termination_manager.terminated[env_ids]
+        if strategy == "binary_failure"
+        else None
+      ),
+      episode_similarity_sum=(
+        self._episode_similarity_sum[env_ids]
+        if strategy == "similarity_ema"
+        else None
+      ),
+      episode_step_count=(
+        self._episode_step_count[env_ids]
+        if strategy == "similarity_ema"
+        else None
+      ),
+      similarity_denom=(
+        self._episode_similarity_denom[env_ids]
+        if rsi.similarity_norm_by_remaining_clip and strategy == "similarity_ema"
+        else None
+      ),
+      norm_by_remaining_clip=(
+        rsi.similarity_norm_by_remaining_clip and strategy == "similarity_ema"
+      ),
+    )
+
+  def _set_episode_assist_gain(
+    self, env_ids: torch.Tensor, traj_ids: torch.Tensor, bins: torch.Tensor
+  ) -> None:
+    if not self.cfg.assistive_wrench_enabled:
+      self.episode_assist_gain[env_ids] = 0.0
+      return
+    failure = self.bin_failure_levels[traj_ids, bins]
+    similarity = 1.0 - failure
+    eta = max(self.cfg.assistive_eta, 1.0e-6)
+    self.episode_assist_gain[env_ids] = torch.clamp(
+      1.0 - similarity / eta, 0.0, self.cfg.assistive_beta_max
+    )
+
+  def _adaptive_sampling(self, env_ids: torch.Tensor):
+    self._update_failure_levels(env_ids)
+    rsi = self.cfg.rsi
+
+    traj_ids, bins, time_steps, probs_valid = sample_adaptive_bins(
+      self.bin_failure_levels,
+      self._valid_bin_indices,
+      segment_length=self.motion.segment_length,
+      segment_start_idx=self.motion.segment_start_idx,
+      bin_width_frames=self.bin_width_frames,
+      temperature_base=rsi.temperature_base,
+      uniform_ratio=rsi.uniform_ratio,
+      num_samples=len(env_ids),
+      device=self.device,
+    )
+    self.trajectory_ids[env_ids] = traj_ids
+    self.time_steps[env_ids] = time_steps
+    self._episode_start_bin[env_ids] = bins
+    self._set_episode_similarity_denom(env_ids, traj_ids, time_steps)
+    self._set_episode_assist_gain(env_ids, traj_ids, bins)
+    self._record_bin_visits(traj_ids, bins)
+
+    num_valid = max(1, probs_valid.shape[0])
+    H = -(probs_valid * (probs_valid + 1e-12).log()).sum()
+    self.metrics["sampling_entropy"][:] = (
+      float(H / math.log(num_valid)) if num_valid > 1 else 1.0
+    )
+    pmax, imax = probs_valid.max(dim=0)
+    self.metrics["sampling_top1_prob"][:] = float(pmax)
+    self.metrics["sampling_top1_bin"][:] = float(imax) / float(num_valid)
+
+  def _uniform_sampling(self, env_ids: torch.Tensor):
+    traj_ids = torch.randint(
+      0, self.motion.num_trajectories, (len(env_ids),), device=self.device
+    )
+    seg_lengths = self.motion.segment_length[traj_ids]
+    local_frames = (
+      sample_uniform(0.0, 1.0, (len(env_ids),), device=self.device)
+      * (seg_lengths.float() - 1.0)
+    ).long()
+    self.trajectory_ids[env_ids] = traj_ids
+    self.time_steps[env_ids] = self.motion.segment_start_idx[traj_ids] + local_frames
+    start_bins = self._bin_index_for_frame(traj_ids, self.time_steps[env_ids])
+    self._episode_start_bin[env_ids] = start_bins
+    self._set_episode_similarity_denom(env_ids, traj_ids, self.time_steps[env_ids])
+    self._set_episode_assist_gain(env_ids, traj_ids, start_bins)
+    self._record_bin_visits(traj_ids, start_bins)
+
+    num_valid = max(1, int(self.bin_valid_mask.sum().item()))
+    self.metrics["sampling_entropy"][:] = 1.0
+    self.metrics["sampling_top1_prob"][:] = 1.0 / num_valid
+    self.metrics["sampling_top1_bin"][:] = 0.5
+
+  def _tracking_similarity_state(self) -> TrackingSimilarityState:
+    return TrackingSimilarityState(
+      tracked_joint_pos_error=self._tracked_joint_pos_error(),
+      anchor_pos_error=self.anchor_pos_w - self.robot_anchor_pos_w,
+      anchor_ori_error=quat_error_magnitude(
+        self.anchor_quat_w, self.robot_anchor_quat_w
+      ),
+      body_pos_error=torch.sum(
+        torch.square(self.body_pos_relative_w - self.robot_body_pos_w), dim=-1
+      ),
+      body_ori_error=(
+        quat_error_magnitude(self.body_quat_relative_w, self.robot_body_quat_w) ** 2
+      ),
+      body_lin_vel_error=torch.sum(
+        torch.square(self.body_lin_vel_w - self.robot_body_lin_vel_w), dim=-1
+      ),
+      body_ang_vel_error=torch.sum(
+        torch.square(self.body_ang_vel_w - self.robot_body_ang_vel_w), dim=-1
+      ),
+    )
+
+  def _ensure_tracking_reward_indices(self) -> None:
+    if self._tracking_reward_indices is not None:
+      return
+    rsi = self.cfg.rsi
+    self._tracking_reward_indices, self._tracking_reward_weight_sum = (
+      resolve_tracking_reward_indices(
+        self._env.reward_manager,
+        name_prefix=rsi.tracking_reward_prefix,
+      )
+    )
+    if not self._tracking_reward_indices:
+      raise ValueError(
+        "similarity_from_rewards requires at least one reward term "
+        f"matching prefix {rsi.tracking_reward_prefix!r} with weight > 0."
+      )
+
+  def _step_tracking_similarity(self) -> torch.Tensor:
+    if self.cfg.rsi.similarity_from_rewards:
+      self._ensure_tracking_reward_indices()
+      return step_tracking_reward_similarity(
+        self._env.reward_manager._step_reward,
+        self._tracking_reward_indices,
+        self._tracking_reward_weight_sum,
+      )
+    return step_tracking_similarity(
+      self._similarity_terms,
+      self._similarity_term_weight_sum,
+      self._tracking_similarity_state(),
+      num_envs=self.num_envs,
+      device=self.device,
+    )
+
+  def _bin_index_for_frame(
+    self, trajectory_ids: torch.Tensor, time_steps: torch.Tensor
+  ):
+    return bin_index_for_frame(
+      segment_start_idx=self.motion.segment_start_idx,
+      time_steps=time_steps,
+      trajectory_ids=trajectory_ids,
+      bin_width_frames=self.bin_width_frames,
+      bins_per_trajectory=self.bins_per_trajectory,
+    )
+
+  # --- WBC reference features (Table S3); stacked in ``command`` for the actor. ---
+  # SE layouts use ``ref_anchor_pos_w`` / ``ref_anchor_ori_6d`` via ``presets/se_actor.py`` instead.
+
+  @property
+  def ref_base_height(self) -> torch.Tensor:
+    """Anchor height relative to env origin (z_I r̂_IB)."""
+    return self.anchor_pos_w[:, 2:3] - self._env.scene.env_origins[:, 2:3]
+
+  @property
+  def ref_base_lin_vel_b(self) -> torch.Tensor:
+    """Reference anchor linear velocity in anchor frame (B v̂_IB)."""
+    return quat_apply_inverse(self.anchor_quat_w, self.anchor_lin_vel_w)
+
+  @property
+  def ref_base_ang_vel_b(self) -> torch.Tensor:
+    """Reference anchor angular velocity in anchor frame (B ω̂_IB)."""
+    return quat_apply_inverse(self.anchor_quat_w, self.anchor_ang_vel_w)
+
+  @property
+  def ref_gravity_b(self) -> torch.Tensor:
+    """Reference gravity in anchor frame (B ĝ_I)."""
+    return quat_apply_inverse(self.anchor_quat_w, self.robot.data.gravity_vec_w)
+
+  @property
+  def ref_base_lin_acc_b(self) -> torch.Tensor:
+    return quat_apply_inverse(self.anchor_quat_w, self.anchor_lin_acc_w)
+
+  @property
+  def ref_base_ang_acc_b(self) -> torch.Tensor:
+    return quat_apply_inverse(self.anchor_quat_w, self.anchor_ang_acc_w)
+
+  @property
+  def tracked_joint_pos(self) -> torch.Tensor:
+    """Reference joint positions for actuated / tracked DoFs (absolute)."""
+    if self._tracked_joint_ids is not None:
+      return self.joint_pos[:, self._tracked_joint_ids]
+    return self.joint_pos
+
+  @property
+  def tracked_joint_vel(self) -> torch.Tensor:
+    """Reference joint velocities for actuated / tracked DoFs (absolute)."""
+    if self._tracked_joint_ids is not None:
+      return self.joint_vel[:, self._tracked_joint_ids]
+    return self.joint_vel
+
+  @property
+  def command(self) -> torch.Tensor:
+    """Legacy stacked WBC reference vector (same layout as default ref obs terms).
+
+    Prefer configuring individual reference observation terms in ``wbc_env_cfg``.
+    Kept for ONNX metadata, ``wbc_command_dim``, and legacy deploy bundles.
+    """
+    return torch.cat(
+      [
+        self.ref_base_height,
+        self.ref_base_lin_vel_b,
+        self.ref_base_ang_vel_b,
+        self.ref_gravity_b,
+        self.tracked_joint_pos,
+      ],
+      dim=-1,
+    )
+
+  @property
+  def wbc_command_dim(self) -> int:
+    return int(self.command.shape[-1])
+
+  @property
+  def joint_pos(self) -> torch.Tensor:
+    return self.motion.joint_pos[self.time_steps]
+
+  @property
+  def joint_vel(self) -> torch.Tensor:
+    return self.motion.joint_vel[self.time_steps]
+
+  def _tracked_joint_pos_error(self) -> torch.Tensor:
+    error = self.joint_pos - self.robot_joint_pos
+    if self._tracked_joint_ids is not None:
+      error = error[:, self._tracked_joint_ids]
+    return error
+
+  def _tracked_joint_vel_error(self) -> torch.Tensor:
+    error = self.joint_vel - self.robot_joint_vel
+    if self._tracked_joint_ids is not None:
+      error = error[:, self._tracked_joint_ids]
+    return error
+
+  @property
+  def body_pos_w(self) -> torch.Tensor:
+    return (
+      self.motion.body_pos_w[self.time_steps]
+      + self._env.scene.env_origins[:, None, :]
+    )
+
+  @property
+  def body_quat_w(self) -> torch.Tensor:
+    return self.motion.body_quat_w[self.time_steps]
+
+  @property
+  def body_lin_vel_w(self) -> torch.Tensor:
+    return self.motion.body_lin_vel_w[self.time_steps]
+
+  @property
+  def body_ang_vel_w(self) -> torch.Tensor:
+    return self.motion.body_ang_vel_w[self.time_steps]
+
+  @property
+  def anchor_pos_w(self) -> torch.Tensor:
+    return (
+      self.motion.body_pos_w[self.time_steps][:, self.motion_anchor_body_index]
+      + self._env.scene.env_origins
+    )
+
+  @property
+  def anchor_quat_w(self) -> torch.Tensor:
+    return self.motion.body_quat_w[self.time_steps][:, self.motion_anchor_body_index]
+
+  @property
+  def anchor_lin_vel_w(self) -> torch.Tensor:
+    return self.motion.body_lin_vel_w[self.time_steps][:, self.motion_anchor_body_index]
+
+  @property
+  def anchor_ang_vel_w(self) -> torch.Tensor:
+    return self.motion.body_ang_vel_w[self.time_steps][:, self.motion_anchor_body_index]
+
+  @property
+  def anchor_lin_acc_w(self) -> torch.Tensor:
+    return self.motion.anchor_lin_acc_w[self.time_steps]
+
+  @property
+  def anchor_ang_acc_w(self) -> torch.Tensor:
+    return self.motion.anchor_ang_acc_w[self.time_steps]
+
+  @property
+  def robot_joint_pos(self) -> torch.Tensor:
+    return self.robot.data.joint_pos
+
+  @property
+  def robot_joint_vel(self) -> torch.Tensor:
+    return self.robot.data.joint_vel
+
+  @property
+  def robot_body_pos_w(self) -> torch.Tensor:
+    return self.robot.data.body_link_pos_w[:, self.body_indexes]
+
+  @property
+  def robot_body_quat_w(self) -> torch.Tensor:
+    return self.robot.data.body_link_quat_w[:, self.body_indexes]
+
+  @property
+  def robot_body_lin_vel_w(self) -> torch.Tensor:
+    return self.robot.data.body_link_lin_vel_w[:, self.body_indexes]
+
+  @property
+  def robot_body_ang_vel_w(self) -> torch.Tensor:
+    return self.robot.data.body_link_ang_vel_w[:, self.body_indexes]
+
+  @property
+  def robot_anchor_pos_w(self) -> torch.Tensor:
+    return self.robot.data.body_link_pos_w[:, self.robot_anchor_body_index]
+
+  @property
+  def robot_anchor_quat_w(self) -> torch.Tensor:
+    return self.robot.data.body_link_quat_w[:, self.robot_anchor_body_index]
+
+  @property
+  def robot_anchor_lin_vel_w(self) -> torch.Tensor:
+    return self.robot.data.body_link_lin_vel_w[:, self.robot_anchor_body_index]
+
+  @property
+  def robot_anchor_ang_vel_w(self) -> torch.Tensor:
+    return self.robot.data.body_link_ang_vel_w[:, self.robot_anchor_body_index]
+
+  def _update_metrics(self):
+    self.metrics["error_anchor_pos"] = torch.norm(
+      self.anchor_pos_w - self.robot_anchor_pos_w, dim=-1
+    )
+    self.metrics["error_anchor_rot"] = quat_error_magnitude(
+      self.anchor_quat_w, self.robot_anchor_quat_w
+    )
+    self.metrics["error_anchor_lin_vel"] = torch.norm(
+      self.anchor_lin_vel_w - self.robot_anchor_lin_vel_w, dim=-1
+    )
+    self.metrics["error_anchor_ang_vel"] = torch.norm(
+      self.anchor_ang_vel_w - self.robot_anchor_ang_vel_w, dim=-1
+    )
+
+    self.metrics["error_body_pos"] = torch.norm(
+      self.body_pos_relative_w - self.robot_body_pos_w, dim=-1
+    ).mean(dim=-1)
+    self.metrics["error_body_rot"] = quat_error_magnitude(
+      self.body_quat_relative_w, self.robot_body_quat_w
+    ).mean(dim=-1)
+
+    self.metrics["error_body_lin_vel"] = torch.norm(
+      self.body_lin_vel_w - self.robot_body_lin_vel_w, dim=-1
+    ).mean(dim=-1)
+    self.metrics["error_body_ang_vel"] = torch.norm(
+      self.body_ang_vel_w - self.robot_body_ang_vel_w, dim=-1
+    ).mean(dim=-1)
+
+    self.metrics["error_joint_pos"] = torch.norm(
+      self._tracked_joint_pos_error(), dim=-1
+    )
+    self.metrics["error_joint_vel"] = torch.norm(
+      self._tracked_joint_vel_error(), dim=-1
+    )
+    self.metrics["assist_gain_mean"] = self.episode_assist_gain
+
+  def _write_reference_state_to_sim(
+    self,
+    env_ids: torch.Tensor,
+    root_pos: torch.Tensor,
+    root_ori: torch.Tensor,
+    root_lin_vel: torch.Tensor,
+    root_ang_vel: torch.Tensor,
+    joint_pos: torch.Tensor,
+    joint_vel: torch.Tensor,
+  ) -> None:
+    soft_limits = self.robot.data.soft_joint_pos_limits[env_ids]
+    joint_pos = torch.clip(joint_pos, soft_limits[:, :, 0], soft_limits[:, :, 1])
+    self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+
+    root_state = torch.cat([root_pos, root_ori, root_lin_vel, root_ang_vel], dim=-1)
+    self.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
+    self.robot.reset(env_ids=env_ids)
+
+  def _resample_command(self, env_ids: torch.Tensor):
+    rsi = self.cfg.rsi
+    if rsi.sampling_mode == "start":
+      self.trajectory_ids[env_ids] = 0
+      self.time_steps[env_ids] = self.motion.segment_start_idx[0]
+      self._episode_start_bin[env_ids] = 0
+      start_traj = self.trajectory_ids[env_ids]
+      start_bins = self._episode_start_bin[env_ids]
+      self._set_episode_similarity_denom(env_ids, start_traj, self.time_steps[env_ids])
+      self._set_episode_assist_gain(env_ids, start_traj, start_bins)
+      self._record_bin_visits(start_traj, start_bins)
+    elif rsi.sampling_mode == "uniform":
+      self._uniform_sampling(env_ids)
+    else:
+      assert rsi.sampling_mode == "adaptive"
+      self._adaptive_sampling(env_ids)
+
+    root_pos = self.body_pos_w[env_ids, 0].clone()
+    root_ori = self.body_quat_w[env_ids, 0].clone()
+    root_lin_vel = self.body_lin_vel_w[env_ids, 0].clone()
+    root_ang_vel = self.body_ang_vel_w[env_ids, 0].clone()
+
+    range_list = [
+      self.cfg.pose_range.get(key, (0.0, 0.0))
+      for key in ["x", "y", "z", "roll", "pitch", "yaw"]
+    ]
+    ranges = torch.tensor(range_list, device=self.device)
+    rand_samples = sample_uniform(
+      ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device
+    )
+    root_pos += rand_samples[:, 0:3]
+    orientations_delta = quat_from_euler_xyz(
+      rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5]
+    )
+    root_ori = quat_mul(orientations_delta, root_ori)
+    range_list = [
+      self.cfg.velocity_range.get(key, (0.0, 0.0))
+      for key in ["x", "y", "z", "roll", "pitch", "yaw"]
+    ]
+    ranges = torch.tensor(range_list, device=self.device)
+    rand_samples = sample_uniform(
+      ranges[:, 0], ranges[:, 1], (len(env_ids), 6), device=self.device
+    )
+    root_lin_vel += rand_samples[:, :3]
+    root_ang_vel += rand_samples[:, 3:]
+
+    joint_pos = self.joint_pos[env_ids].clone()
+    joint_vel = self.joint_vel[env_ids]
+
+    joint_pos += sample_uniform(
+      lower=self.cfg.joint_position_range[0],
+      upper=self.cfg.joint_position_range[1],
+      size=joint_pos.shape,
+      device=joint_pos.device,
+    )
+
+    self._write_reference_state_to_sim(
+      env_ids,
+      root_pos,
+      root_ori,
+      root_lin_vel,
+      root_ang_vel,
+      joint_pos,
+      joint_vel,
+    )
+    self._episode_start_step[env_ids] = self.time_steps[env_ids]
+    self._episode_similarity_sum[env_ids] = 0.0
+    self._episode_step_count[env_ids] = 0
+    self.update_relative_body_poses()
+
+  def update_relative_body_poses(self) -> None:
+    anchor_pos_w_repeat = self.anchor_pos_w[:, None, :].repeat(
+      1, len(self.cfg.body_names), 1
+    )
+    anchor_quat_w_repeat = self.anchor_quat_w[:, None, :].repeat(
+      1, len(self.cfg.body_names), 1
+    )
+    robot_anchor_pos_w_repeat = self.robot_anchor_pos_w[:, None, :].repeat(
+      1, len(self.cfg.body_names), 1
+    )
+    robot_anchor_quat_w_repeat = self.robot_anchor_quat_w[:, None, :].repeat(
+      1, len(self.cfg.body_names), 1
+    )
+
+    delta_pos_w = robot_anchor_pos_w_repeat
+    delta_pos_w[..., 2] = anchor_pos_w_repeat[..., 2]
+    delta_ori_w = yaw_quat(
+      quat_mul(robot_anchor_quat_w_repeat, quat_inv(anchor_quat_w_repeat))
+    )
+
+    self.body_quat_relative_w = quat_mul(delta_ori_w, self.body_quat_w)
+    self.body_pos_relative_w = delta_pos_w + quat_apply(
+      delta_ori_w, self.body_pos_w - anchor_pos_w_repeat
+    )
+
+  def compute(self, dt: float) -> None:
+    self._update_metrics()
+    self.time_left -= dt
+    resample_env_ids = (self.time_left <= 0.0).nonzero().flatten()
+    if len(resample_env_ids) > 0:
+      self._resample(resample_env_ids)
+    self._update_command(advance_time=dt > 0.0)
+
+  def _update_command(self, *, advance_time: bool = True):
+    if self.cfg.rsi.strategy == "similarity_ema" and advance_time:
+      self._episode_similarity_sum += self._step_tracking_similarity()
+      self._episode_step_count += 1
+
+    if advance_time:
+      self.time_steps += 1
+
+    seg_end = self.motion.segment_end_idx[self.trajectory_ids]
+    env_ids = torch.where(self.time_steps >= seg_end)[0]
+    if env_ids.numel() > 0:
+      self._resample_command(env_ids)
+
+    self.update_relative_body_poses()
+
+  def set_viewer_task_id(self, task_id: str | None) -> None:
+    self._viewer_task_id = task_id
+
+  def _record_bin_visits(self, traj_ids: torch.Tensor, bins: torch.Tensor) -> None:
+    for traj_id, bin_id in zip(traj_ids.tolist(), bins.tolist(), strict=True):
+      self.bin_visit_counts[int(traj_id), int(bin_id)] += 1.0
+
+  def _rsi_view_tensors(
+    self,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    rsi = self.cfg.rsi
+    failure = self.bin_failure_levels
+    prob = compute_sampling_prob_matrix(
+      failure,
+      self.bin_valid_mask,
+      temperature_base=rsi.temperature_base,
+      uniform_ratio=rsi.uniform_ratio,
+    )
+    assist = compute_assist_gain_matrix(
+      failure,
+      eta=self.cfg.assistive_eta,
+      beta_max=self.cfg.assistive_beta_max,
+      enabled=self.cfg.assistive_wrench_enabled,
+    )
+    return (
+      failure.detach().cpu(),
+      prob.detach().cpu(),
+      self.bin_visit_counts.detach().cpu(),
+      assist.detach().cpu(),
+      self.bin_valid_mask.detach().cpu(),
+    )
+
+  def _clip_name(self, traj_id: int) -> str:
+    return clip_name_for_trajectory(self.motion.segment_names, traj_id)
+
+  def _segment_phase(self, env_idx: int) -> float:
+    traj_id = int(self.trajectory_ids[env_idx].item())
+    seg_start = int(self.motion.segment_start_idx[traj_id].item())
+    seg_len = max(int(self.motion.segment_length[traj_id].item()) - 1, 1)
+    local = int(self.time_steps[env_idx].item()) - seg_start
+    return float(np.clip(local / seg_len, 0.0, 1.0))
+
+  def _body_tracking_errors(self, env_idx: int) -> tuple[np.ndarray, np.ndarray]:
+    pos_err = torch.norm(
+      self.body_pos_relative_w[env_idx] - self.robot_body_pos_w[env_idx], dim=-1
+    )
+    rot_err = quat_error_magnitude(
+      self.body_quat_relative_w[env_idx], self.robot_body_quat_w[env_idx]
+    )
+    return pos_err.cpu().numpy(), rot_err.cpu().numpy()
+
+  def update_viewer_gui(self, env_idx: int) -> None:
+    if self._viewer_context_html is None:
+      return
+    traj_id = int(self.trajectory_ids[env_idx].item())
+    frame = int(self.time_steps[env_idx].item())
+    self._viewer_context_html.content = format_motion_context_html(
+      env_idx=env_idx,
+      traj_id=traj_id,
+      clip_name=self._clip_name(traj_id),
+      frame=frame,
+      phase=self._segment_phase(env_idx),
+      task_id=self._viewer_task_id,
+      rsi_mode=self.cfg.rsi.sampling_mode,
+      rsi_strategy=self.cfg.rsi.strategy,
+      anchor_body=self.cfg.anchor_body_name,
+      num_bodies=len(self.cfg.body_names),
+    )
+    if self._viewer_rsi_html is None:
+      return
+    bin_idx = int(
+      self._bin_index_for_frame(
+        self.trajectory_ids[env_idx : env_idx + 1],
+        self.time_steps[env_idx : env_idx + 1],
+      ).item()
+    )
+    failure, prob, visits, assist, valid = self._rsi_view_tensors()
+    rsi = self.cfg.rsi
+    traj_probs = trajectory_conditional_prob_row(prob, valid, traj_id)
+    self._viewer_rsi_html.content = format_rsi_panel_html(
+      bin_idx=bin_idx,
+      num_bins=self.bins_per_trajectory,
+      bin_width_s=rsi.bin_width_s,
+      failure_levels=failure[traj_id].tolist(),
+      sampling_probs=traj_probs,
+      visit_counts=visits[traj_id].tolist(),
+      assist_gains=assist[traj_id].tolist(),
+      valid_mask=valid[traj_id].tolist(),
+      failure_signal_label=rsi_failure_signal_label(
+        rsi.strategy,
+        similarity_from_rewards=rsi.similarity_from_rewards,
+      ),
+      show_assist=self.cfg.assistive_wrench_enabled,
+      beta_max=self.cfg.assistive_beta_max,
+    )
+
+  def _debug_vis_impl(self, visualizer: DebugVisualizer) -> None:
+    env_indices = visualizer.get_env_indices(self.num_envs)
+    if not env_indices:
+      return
+
+    if self.cfg.viz.mode == "ghost":
+      if self._ghost_model is None:
+        self._ghost_model = copy.deepcopy(self._env.sim.mj_model)
+        self._ghost_model.geom_rgba[:] = self._ghost_color
+
+      entity: Entity = self._env.scene[self.cfg.entity_name]
+      indexing = entity.indexing
+      free_joint_q_adr = indexing.free_joint_q_adr.cpu().numpy()
+      joint_q_adr = indexing.joint_q_adr.cpu().numpy()
+
+      for batch in env_indices:
+        if self._viewer_align_xy_yaw:
+          root_pos = self.body_pos_relative_w[batch, 0].cpu().numpy()
+          root_quat = self.body_quat_relative_w[batch, 0].cpu().numpy()
+        else:
+          root_pos = self.body_pos_w[batch, 0].cpu().numpy()
+          root_quat = self.body_quat_w[batch, 0].cpu().numpy()
+        qpos = np.zeros(self._env.sim.mj_model.nq)
+        qpos[free_joint_q_adr[0:3]] = root_pos
+        qpos[free_joint_q_adr[3:7]] = root_quat
+        qpos[joint_q_adr] = self.joint_pos[batch].cpu().numpy()
+        visualizer.add_ghost_mesh(qpos, model=self._ghost_model, label=f"ghost_{batch}")
+        if self._viewer_color_bodies:
+          self._add_body_error_markers(visualizer, batch)
+
+    elif self.cfg.viz.mode == "frames":
+      for batch in env_indices:
+        if self._viewer_align_xy_yaw:
+          desired_body_pos = self.body_pos_relative_w[batch].cpu().numpy()
+          desired_body_quat = self.body_quat_relative_w[batch]
+        else:
+          desired_body_pos = self.body_pos_w[batch].cpu().numpy()
+          desired_body_quat = self.body_quat_w[batch]
+        desired_body_rotm = matrix_from_quat(desired_body_quat).cpu().numpy()
+
+        current_body_pos = self.robot_body_pos_w[batch].cpu().numpy()
+        current_body_quat = self.robot_body_quat_w[batch]
+        current_body_rotm = matrix_from_quat(current_body_quat).cpu().numpy()
+
+        pos_err, rot_err = self._body_tracking_errors(batch)
+        for i, body_name in enumerate(self.cfg.body_names):
+          err = float(pos_err[i] + rot_err[i])
+          axis_colors = None
+          if self._viewer_color_bodies:
+            rgba = error_to_rgba(err)
+            rgb = (rgba[0], rgba[1], rgba[2])
+            axis_colors = (rgb, rgb, rgb)
+          visualizer.add_frame(
+            position=desired_body_pos[i],
+            rotation_matrix=desired_body_rotm[i],
+            scale=0.08,
+            label=f"desired_{body_name}_{batch}",
+            axis_colors=axis_colors or _DESIRED_FRAME_COLORS,
+          )
+          visualizer.add_frame(
+            position=current_body_pos[i],
+            rotation_matrix=current_body_rotm[i],
+            scale=0.12,
+            label=f"current_{body_name}_{batch}",
+            axis_colors=axis_colors,
+          )
+          if self._viewer_color_bodies:
+            visualizer.add_sphere(
+              center=current_body_pos[i],
+              radius=0.025,
+              color=error_to_rgba(err),
+              label=f"err_{body_name}_{batch}",
+            )
+
+        if self._viewer_align_xy_yaw:
+          desired_anchor_pos = self.body_pos_relative_w[batch, self.motion_anchor_body_index]
+          desired_anchor_quat = self.body_quat_relative_w[batch, self.motion_anchor_body_index]
+        else:
+          desired_anchor_pos = self.anchor_pos_w[batch]
+          desired_anchor_quat = self.anchor_quat_w[batch]
+        desired_rotation_matrix = matrix_from_quat(desired_anchor_quat).cpu().numpy()
+        visualizer.add_frame(
+          position=desired_anchor_pos.cpu().numpy(),
+          rotation_matrix=desired_rotation_matrix,
+          scale=0.1,
+          label=f"desired_anchor_{batch}",
+          axis_colors=_DESIRED_FRAME_COLORS,
+        )
+
+        current_anchor_pos = self.robot_anchor_pos_w[batch].cpu().numpy()
+        current_anchor_quat = self.robot_anchor_quat_w[batch]
+        current_rotation_matrix = matrix_from_quat(current_anchor_quat).cpu().numpy()
+        visualizer.add_frame(
+          position=current_anchor_pos,
+          rotation_matrix=current_rotation_matrix,
+          scale=0.15,
+          label=f"current_anchor_{batch}",
+        )
+
+  def _add_body_error_markers(
+    self, visualizer: DebugVisualizer, env_idx: int
+  ) -> None:
+    pos_err, rot_err = self._body_tracking_errors(env_idx)
+    body_pos = self.robot_body_pos_w[env_idx].cpu().numpy()
+    for i, body_name in enumerate(self.cfg.body_names):
+      err = float(pos_err[i] + rot_err[i])
+      visualizer.add_sphere(
+        center=body_pos[i],
+        radius=0.03,
+        color=error_to_rgba(err),
+        label=f"err_{body_name}_{env_idx}",
+      )
+
+  def create_gui(
+    self,
+    name: str,
+    server: viser.ViserServer,
+    get_env_idx: Callable[[], int],
+    on_change: Callable[[], None] | None = None,
+    request_action: Callable[[str, Any], None] | None = None,
+  ) -> None:
+    max_frame = int(self.motion.time_step_total) - 1
+
+    with server.gui.add_folder(name.capitalize()):
+      with server.gui.add_folder("Selected env", expand_by_default=True):
+        self._viewer_context_html = server.gui.add_html("")
+
+      with server.gui.add_folder("Adaptive sampling (RSI)", expand_by_default=False):
+        self._viewer_rsi_html = server.gui.add_html("")
+
+      align_cb = server.gui.add_checkbox(
+        "Align xy/yaw to reference",
+        initial_value=self._viewer_align_xy_yaw,
+      )
+      color_cb = server.gui.add_checkbox(
+        "Color bodies by tracking error",
+        initial_value=self._viewer_color_bodies,
+      )
+
+      @align_cb.on_update
+      def _on_align(_) -> None:
+        self._viewer_align_xy_yaw = bool(align_cb.value)
+        if on_change is not None:
+          on_change()
+
+      @color_cb.on_update
+      def _on_color(_) -> None:
+        self._viewer_color_bodies = bool(color_cb.value)
+        if on_change is not None:
+          on_change()
+
+      scrubber = server.gui.add_slider(
+        "Frame",
+        min=0,
+        max=max_frame,
+        step=1,
+        initial_value=0,
+      )
+
+      @scrubber.on_update
+      def _(_) -> None:
+        idx = get_env_idx()
+        self.time_steps[idx] = int(scrubber.value)
+        if on_change is not None:
+          on_change()
+
+      all_envs_cb = server.gui.add_checkbox("All envs", initial_value=True)
+      start_btn = server.gui.add_button("Start Here")
+
+      @start_btn.on_click
+      def _(_) -> None:
+        if request_action is not None:
+          request_action(
+            "CUSTOM",
+            {"type": "gui_reset", "all_envs": all_envs_cb.value},
+          )
+
+    self._scrubber_handles = (scrubber, all_envs_cb, start_btn)
+    self._set_scrubber_disabled(True)
+    self.update_viewer_gui(get_env_idx())
+
+  def _set_scrubber_disabled(self, disabled: bool) -> None:
+    for handle in self._scrubber_handles:
+      handle.disabled = disabled
+
+  def on_viewer_pause(self, paused: bool) -> None:
+    if hasattr(self, "_scrubber_handles"):
+      self._set_scrubber_disabled(not paused)
+
+  def apply_gui_reset(self, env_ids: torch.Tensor) -> bool:
+    if not hasattr(self, "_scrubber_handles"):
+      return False
+    frame = int(self._scrubber_handles[0].value)
+    self.reset_to_frame(env_ids, frame)
+    self.update_relative_body_poses()
+    return True
+
+  def reset_to_frame(self, env_ids: torch.Tensor, frame: int) -> None:
+    self.time_steps[env_ids] = frame
+    traj_ids = torch.searchsorted(
+      self.motion.segment_end_idx,
+      torch.full((len(env_ids),), frame, device=self.device),
+      right=False,
+    )
+    traj_ids = torch.clamp(traj_ids, max=self.motion.num_trajectories - 1)
+    self.trajectory_ids[env_ids] = traj_ids
+    self._write_reference_state_to_sim(
+      env_ids,
+      self.body_pos_w[env_ids, 0],
+      self.body_quat_w[env_ids, 0],
+      self.body_lin_vel_w[env_ids, 0],
+      self.body_ang_vel_w[env_ids, 0],
+      self.joint_pos[env_ids],
+      self.joint_vel[env_ids],
+    )
+
+
+@dataclass(kw_only=True)
+class MotionCommandCfg(MjlabMotionCommandCfg):
+  """Config for :class:`MotionCommand` (set per robot in ``<robot>_base_cfg``)."""
+
+  motion_file: str
+  """Path to converted NPZ library (from ``wbc-mjlab-data-to-npz``)."""
+  anchor_body_name: str
+  """Body used for anchor-frame errors and assistive wrench."""
+  body_names: tuple[str, ...]
+  """Keybodies tracked in rewards, RSI, and critic observations."""
+  entity_name: str
+  """Scene entity name for the robot (usually ``\"robot\"``)."""
+  actuated_joint_names: tuple[str, ...] = ()
+  """If set, joint tracking metrics/RSI use only these DoFs (subset of the robot)."""
+  pose_range: dict[str, tuple[float, float]] = field(default_factory=dict)
+  """Domain randomization ranges for reference root pose at resample."""
+  velocity_range: dict[str, tuple[float, float]] = field(default_factory=dict)
+  """Domain randomization ranges for reference root velocity at resample."""
+  joint_position_range: tuple[float, float] = (-0.52, 0.52)
+  """Domain randomization range for joint position offsets at resample."""
+  rsi: RsiCfg = field(default_factory=RsiCfg)
+  """Reference-state initialization / adaptive bin sampling."""
+  assistive_wrench_enabled: bool = True
+  """Whether assistive wrench curriculum is active."""
+  assistive_beta_max: float = 0.6
+  """Max assistive gain β."""
+  assistive_eta: float = 0.8
+  """Assistive wrench curriculum exponent."""
+
+  @dataclass
+  class VizCfg:
+    mode: Literal["ghost", "frames"] = "ghost"
+    ghost_color: tuple[float, float, float, float] = (0.45, 0.6, 0.9, 0.5)
+
+  viz: VizCfg = field(default_factory=VizCfg)
+
+  def build(self, env: ManagerBasedRlEnv) -> MotionCommand:
+    return MotionCommand(self, env)

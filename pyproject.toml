@@ -1,0 +1,135 @@
+[build-system]
+requires = ["uv_build>=0.8.19,<0.9.0"]
+build-backend = "uv_build"
+
+[project]
+name = "wbc-mjlab"
+version = "0.0.5"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+description = "Unified whole-body motion tracking on mjlab — one MDP, paper methods as tasks"
+readme = { file = "README.md", content-type = "text/markdown" }
+authors = [
+  { name = "Simeon Nedelchev" },
+  { name = "Anton Chaplygin" },
+  { name = "Lev Kozlov" },
+  { name = "Ivan Domrachev" },
+]
+requires-python = ">=3.10,<3.14"
+keywords = [
+  "mjlab",
+  "whole-body-control",
+  "motion-tracking",
+  "reinforcement-learning",
+  "robotics",
+  "unitree-g1",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3 :: Only",
+  "Environment :: GPU :: NVIDIA CUDA",
+  "Topic :: Scientific/Engineering",
+  "Natural Language :: English",
+]
+dependencies = [
+  "mjlab>=1.5.0",
+  # mediapy (mjlab dep) breaks on numpy 2.5+; keep in sync with mjlab.
+  "numpy<2.5",
+]
+
+[project.urls]
+"Bug Reports" = "https://github.com/wbc-mjlab/wbc-mjlab/issues"
+Source = "https://github.com/wbc-mjlab/wbc-mjlab"
+
+[project.scripts]
+wbc-mjlab-list-envs = "wbc_mjlab.scripts.list_envs:main"
+wbc-mjlab-train = "wbc_mjlab.scripts.train:main"
+wbc-mjlab-play = "wbc_mjlab.scripts.play:main"
+wbc-mjlab-demo = "wbc_mjlab.scripts.demo:main"
+wbc-mjlab-data-to-npz = "wbc_mjlab.motion.data_to_npz:cli"
+wbc-mjlab-export-tracking-params = "wbc_mjlab.export.export_cli:main"
+wbc-mjlab-export-web-reference = "wbc_mjlab.export.web_reference_bundle:main"
+wbc-mjlab-data-vis = "wbc_mjlab.scripts.vis_data:cli"
+wbc-mjlab-plot-rsi-bins = "wbc_mjlab.scripts.plot_rsi_bins:main"
+forgetmimic = "wbc_mjlab.scripts.unlearning:main"
+
+[project.entry-points."mjlab.tasks"]
+wbc_mjlab = "wbc_mjlab.mjlab_entry"
+
+[project.optional-dependencies]
+cu128 = ["torch>=2.7.0"]
+cpu = ["torch>=2.7.0"]
+
+[dependency-groups]
+dev = [
+  "pre-commit>=4.3.0",
+  "pytest>=8.0.0",
+  "ruff>=0.14.14",
+]
+docs = [
+  "sphinx>=8.1",
+  "sphinx-autobuild>=2024.10",
+  "sphinx-book-theme>=1.1",
+  "sphinx-copybutton>=0.5",
+  "sphinx-design>=0.6",
+  "sphinxcontrib-bibtex>=2.6",
+]
+
+[tool.uv]
+conflicts = [
+  [{ extra = "cu128" }, { extra = "cpu" }],
+]
+constraint-dependencies = [
+  "GitPython>=3.1.49",
+  "lxml>=6.1.0",
+]
+required-environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com/"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+warp-lang = { index = "nvidia", marker = "sys_platform != 'darwin'" }
+torch = [
+  { index = "pytorch-cu128", extra = "cu128", marker = "sys_platform != 'darwin'" },
+  { index = "pytorch-cpu", extra = "cpu", marker = "sys_platform != 'darwin'" },
+]
+
+[tool.ruff]
+indent-width = 2
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B"]
+
+[tool.pytest.ini_options]
+markers = [
+  "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+addopts = "--strict-markers"
